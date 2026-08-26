@@ -1,0 +1,12 @@
+{
+  "skills": [
+    {
+      "id": "chatter_diagnosis",
+      "label": "颤振诊断",
+      "icon": "🔬",
+      "description": "颤振诊断双模式 Skill：①颤振诊断模式（50维特征 → 归一化 → SAE降维16维 → 弱分类器 → Stacking集成，三分类：稳定/轻微颤振/严重颤振）；②实时监控模式（基于稳态基线的 z-score 偏离监测，🟢<2.0 / 🟡2.0~3.5 / 🔴≥3.5）。",
+      "version": "3.1.0",
+      "entry": "script/chatter_diagnosis_skill.py"
+    }
+  ]
+}
