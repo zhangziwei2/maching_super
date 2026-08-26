@@ -1,0 +1,68 @@
+# ===== Python 缓存 =====
+__pycache__/
+*.pyc
+*.pyo
+
+# ===== 模型/数据文件 =====
+*.pkl
+*.pth
+*.bin
+*.h5
+*.npy
+*.npz
+*.csv
+*.db
+
+# ===== 压缩包 =====
+*.zip
+*.rar
+*.7z
+*.tar
+*.gz
+
+# ===== PDF =====
+*.pdf
+
+# ===== CatBoost 临时文件 =====
+catboost_info/
+
+# ===== 临时/备份文件 =====
+*.tmp
+*.bak
+
+# ===== 日志 =====
+*.log
+*_err.txt
+*_log.txt
+# ===== 文本文件 =====
+*.txt
+# ===== 图片 =====
+*.png
+*.jpg
+
+# ===== 虚拟环境 =====
+.venv/
+
+# ===== 系统文件 =====
+Thumbs.db
+.DS_Store
+
+# 数据库/存储卷
+volumes/
+**/volumes/
+# 环境变量（密钥）
+.env
+
+# 虚拟环境
+.venv/
+
+# IDE
+.idea/
+.vscode/
+
+# Claude
+.claude/
+
+# Python 缓存
+__pycache__/
+*.pyc
