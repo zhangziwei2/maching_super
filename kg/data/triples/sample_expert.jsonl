@@ -1,0 +1,3 @@
+{"h": {"name": "颤振", "type": "FaultType"}, "r": {"type": "occurs_in"}, "t": {"name": "主轴", "type": "Component"}}
+{"h": {"name": "颤振", "type": "FaultType"}, "r": {"type": "related_to"}, "t": {"name": "振动过大", "type": "FaultType"}}
+{"h": {"name": "切削液浓度过低", "type": "Cause"}, "r": {"type": "causes"}, "t": {"name": "刀具磨损", "type": "FaultType"}}
