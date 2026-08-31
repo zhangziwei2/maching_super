@@ -21,59 +21,94 @@ KG_DIR = os.path.join(PROJECT_ROOT, "kg")
 if os.path.exists(KG_DIR) and KG_DIR not in sys.path:
     sys.path.insert(0, KG_DIR)
 
+import contextvars
+import logging
+
+# 检索片段分隔符：tools 拼接与 context_compact 分块落盘共用同一常量，
+# 避免压缩模块依赖字符串解析时出现格式漂移
+CHUNK_SEPARATOR = "\n\n---\n\n"
+
 AMAP_WEATHER_API = os.getenv("AMAP_WEATHER_API")
 AMAP_API_KEY = os.getenv("AMAP_API_KEY")
 
-_LAST_RAG_CONTEXT = None
-_KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
-_RAG_STEP_QUEUE = None  # asyncio.Queue, set by agent before streaming
-_RAG_STEP_LOOP = None  # asyncio loop, captured when setting queue
+logger = logging.getLogger(__name__)
+
+# 请求级状态：用 ContextVar 替代模块级全局变量。
+# 背景：检索在 ThreadPoolExecutor 中并发执行，多个请求/多个 asyncio 任务同时
+# 读写模块级全局会互相覆盖（A 的检索上下文被 B 覆盖、进度串到 B 的流）。
+# ContextVar 对 asyncio 任务天然隔离；线程池场景由 agent 在提交任务时显式
+# 复制当前 context（contextvars.copy_context().run），保证各请求互不干扰。
+_last_rag_context: contextvars.ContextVar[Optional[dict]] = contextvars.ContextVar(
+    "last_rag_context", default=None
+)
+_knowledge_tool_calls: contextvars.ContextVar[int] = contextvars.ContextVar(
+    "knowledge_tool_calls", default=0
+)
+_rag_step_queue: contextvars.ContextVar = contextvars.ContextVar("rag_step_queue", default=None)
+_rag_step_loop: contextvars.ContextVar = contextvars.ContextVar("rag_step_loop", default=None)
+# 请求身份（user_id / session_id）：Hooks 需要按用户读写记忆，但 hook 签名里
+# 并不总有 user_id（如 Stop）。复用同一 ContextVar 载体传递，不另起全局状态。
+_request_identity: contextvars.ContextVar = contextvars.ContextVar("request_identity", default=None)
+
+
+def set_request_identity(user_id: str, session_id: str = "") -> None:
+    """记录当前请求的身份，供 Hooks 读取（记忆系统按用户隔离依赖此值）。
+
+    ⚠️ 必须在主线程上下文设置：流式链路中 _prepare_answer 跑在 copy_context()
+    派生的子上下文里，在那里 set 的值不会回传主上下文，Stop 钩子将读不到。
+    """
+    _request_identity.set({"user_id": user_id, "session_id": session_id})
+
+
+def get_request_identity() -> Optional[dict]:
+    """获取当前请求身份，未设置时返回 None"""
+    return _request_identity.get()
 
 
 def _set_last_rag_context(context: dict):
-    global _LAST_RAG_CONTEXT
-    _LAST_RAG_CONTEXT = context
+    _last_rag_context.set(context)
 
 
 def get_last_rag_context(clear: bool = True) -> Optional[dict]:
     """获取最近一次 RAG 检索上下文，默认读取后清空。"""
-    global _LAST_RAG_CONTEXT
-    context = _LAST_RAG_CONTEXT
+    context = _last_rag_context.get()
     if clear:
-        _LAST_RAG_CONTEXT = None
+        _last_rag_context.set(None)
     return context
 
 
 def reset_tool_call_guards():
     """每轮对话开始时重置工具调用计数。"""
-    global _KNOWLEDGE_TOOL_CALLS_THIS_TURN
-    _KNOWLEDGE_TOOL_CALLS_THIS_TURN = 0
+    _knowledge_tool_calls.set(0)
 
 
 def set_rag_step_queue(queue):
     """设置 RAG 步骤队列，并捕获当前事件循环以便跨线程调度。"""
-    global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
-    _RAG_STEP_QUEUE = queue
+    _rag_step_queue.set(queue)
     if queue:
         import asyncio
         try:
-            _RAG_STEP_LOOP = asyncio.get_running_loop()
+            _rag_step_loop.set(asyncio.get_running_loop())
         except RuntimeError:
-            _RAG_STEP_LOOP = asyncio.get_event_loop()
+            try:
+                _rag_step_loop.set(asyncio.get_event_loop())
+            except RuntimeError:
+                _rag_step_loop.set(None)
     else:
-        _RAG_STEP_LOOP = None
+        _rag_step_loop.set(None)
 
 
 def emit_rag_step(icon: str, label: str, detail: str = ""):
     """向队列发送一个 RAG 检索步骤。支持跨线程安全调用。"""
-    global _RAG_STEP_QUEUE, _RAG_STEP_LOOP
-    if _RAG_STEP_QUEUE is not None and _RAG_STEP_LOOP is not None:
+    queue = _rag_step_queue.get()
+    loop = _rag_step_loop.get()
+    if queue is not None and loop is not None:
         step = {"icon": icon, "label": label, "detail": detail}
         try:
-            if not _RAG_STEP_LOOP.is_closed():
-                _RAG_STEP_LOOP.call_soon_threadsafe(_RAG_STEP_QUEUE.put_nowait, step)
-        except Exception:
-            pass
+            if not loop.is_closed():
+                loop.call_soon_threadsafe(queue.put_nowait, step)
+        except Exception as e:
+            logger.debug(f"[rag-step] 推送步骤失败（不影响主链路）: {e}")
 
 
 # ========== 工具定义 ==========
@@ -133,33 +168,6 @@ def query_knowledge_graph(query: str) -> str:
             return text or ""
         except Exception:
             return ""
-
-
-@tool("web_search")
-def web_search(query: str) -> str:
-    """
-    联网搜索获取实时信息。
-    
-    当知识图谱和 RAG 都无法回答问题时，使用此工具联网搜索。
-    适用于：实时信息、最新技术、网络资料等。
-    
-    Args:
-        query: 搜索关键词（中文）
-        
-    Returns:
-        搜索结果摘要
-    """
-    try:
-        from kg.tavily_search import TavilySearch
-        searcher = TavilySearch()
-        if not searcher.is_configured():
-            return "联网搜索未配置（缺少 TAVILY_API_KEY）"
-        result = searcher.search(query, context="机床故障诊断")
-        if not result:
-            return "联网搜索未找到相关结果。"
-        return result
-    except Exception as e:
-        return f"联网搜索失败: {str(e)}"
 
 
 @tool("get_current_weather")
@@ -230,18 +238,19 @@ def search_knowledge_base(query: str) -> str:
     从文档知识库检索相关段落（Milvus 混合检索 + 父子分块 auto-merging + 查询改写）。
     当用户询问操作手册、设备使用步骤、技术文档内容时使用此工具。
     """
-    global _KNOWLEDGE_TOOL_CALLS_THIS_TURN
-    if _KNOWLEDGE_TOOL_CALLS_THIS_TURN >= 1:
+    if _knowledge_tool_calls.get() >= 1:
         return (
             "TOOL_CALL_LIMIT_REACHED: search_knowledge_base has already been called once in this turn. "
             "Use the existing retrieval result and provide the final answer directly."
         )
-    _KNOWLEDGE_TOOL_CALLS_THIS_TURN += 1
+    _knowledge_tool_calls.set(_knowledge_tool_calls.get() + 1)
 
     try:
         from .rag_pipeline import run_rag_graph
         rag_result = run_rag_graph(query)
     except Exception as e:
+        # 记录日志：Milvus 不可达等故障必须可观测，否则表现为"答非所问"难以排查
+        logger.warning(f"[search_knowledge_base] 知识库检索失败: {e}", exc_info=True)
         return f"知识库检索失败: {e}"
 
     docs = rag_result.get("docs", []) if isinstance(rag_result, dict) else []
@@ -259,7 +268,20 @@ def search_knowledge_base(query: str) -> str:
         text = result.get("text", "")
         formatted.append(f"[{i}] {source} (Page {page}):\n{text}")
 
-    return "Retrieved Chunks:\n" + "\n\n---\n\n".join(formatted)
+    # Answerability 门控：非 pass 时向 LLM 附加置信度/矛盾警告（硬拒答由 agent 层拦截）
+    gate = rag_result.get("answerability", {}) if isinstance(rag_result, dict) else {}
+    status = gate.get("status")
+    if status in ("soft_reject", "conflict"):
+        warning_map = {
+            "soft_reject": "检索到的资料置信度低于安全阈值。若基于这些资料回答，必须明确说明不确定性，并指出缺失的信息。",
+            "conflict": "不同来源资料对同一问题给出了相反结论。请勿直接采信任一方，应向用户说明矛盾并请其提供更权威信息。",
+        }
+        formatted.append(f"\n[检索置信度警告] {warning_map[status]}")
+        missing = gate.get("missing")
+        if missing:
+            formatted.append("依据缺失：" + "；".join(missing))
+
+    return "Retrieved Chunks:\n" + CHUNK_SEPARATOR.join(formatted)
 
 
 @tool("diagnose_chatter")

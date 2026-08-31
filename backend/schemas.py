@@ -71,6 +71,8 @@ class RagTrace(BaseModel):
     retrieved_chunks: Optional[List[RetrievedChunk]] = None
     initial_retrieved_chunks: Optional[List[RetrievedChunk]] = None
     expanded_retrieved_chunks: Optional[List[RetrievedChunk]] = None
+    # Answerability 门控（Item2）：pass / hard_reject / soft_reject / conflict
+    answerability: Optional[dict] = None
 
 
 class ChatResponse(BaseModel):
@@ -109,6 +111,45 @@ class DocumentInfo(BaseModel):
     file_type: str
     chunk_count: int
     uploaded_at: Optional[str] = None
+
+
+class MemoryCreate(BaseModel):
+    """写入/更新记忆。scope='machine' 时仅管理员可提交。"""
+    name: str
+    body: str
+    description: Optional[str] = ""
+    mem_type: str = "project"
+    scope: str = "personal"
+
+
+class MemoryConfirm(BaseModel):
+    """确认信号写入：用户标记本轮问答有效，直接存为记忆（零 LLM）"""
+    question: str
+    answer: str
+    name: Optional[str] = ""
+    mem_type: str = "project"
+
+
+class MemoryInfo(BaseModel):
+    id: int
+    user_id: Optional[str] = None
+    created_by: Optional[str] = None
+    scope: str
+    mem_type: str
+    name: str
+    description: str
+    body: str
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+
+
+class MemoryListResponse(BaseModel):
+    memories: List[MemoryInfo]
+
+
+class MemoryDeleteResponse(BaseModel):
+    id: int
+    message: str
 
 
 class DocumentListResponse(BaseModel):

@@ -1,4 +1,4 @@
-"""文档向量化并写入 Milvus - 支持密集+稀疏向量"""
+"""文档向量化并写入 Milvus - 密集向量由 embedding 服务生成，稀疏向量由 Milvus 内置 BM25 Function 自动生成"""
 from .embedding import EmbeddingService, embedding_service as _default_embedding_service
 from .milvus_client import MilvusManager
 
@@ -12,8 +12,9 @@ class MilvusWriter:
 
     def write_documents(self, documents: list[dict], batch_size: int = 200, progress_callback=None):
         """
-        批量写入文档到 Milvus（同时生成密集和稀疏向量）
-        优化：增大默认 batch_size 到 200，提升向量化速度
+        批量写入文档到 Milvus。
+        密集向量由独立 embedding 服务生成；稀疏向量无需写入，
+        Milvus 内置 BM25 Function 会根据 text 自动计算并入库。
         :param documents: 文档列表
         :param batch_size: 批次大小（默认200）
         """
@@ -22,21 +23,17 @@ class MilvusWriter:
 
         self.milvus_manager.init_collection()
 
-        all_texts = [doc["text"] for doc in documents]
-        self.embedding_service.increment_add_documents(all_texts)
-
         total = len(documents)
         for i in range(0, total, batch_size):
             batch = documents[i:i + batch_size]
             texts = [doc["text"] for doc in batch]
-            
-            # 同时生成密集向量和稀疏向量
-            dense_embeddings, sparse_embeddings = self.embedding_service.get_all_embeddings(texts)
+
+            # 密集向量（HTTP 调用独立 embedding 服务）
+            dense_embeddings = self.embedding_service.get_embeddings(texts)
 
             insert_data = [
                 {
                     "dense_embedding": dense_emb,
-                    "sparse_embedding": sparse_emb,
                     "text": doc["text"],
                     "filename": doc["filename"],
                     "file_type": doc["file_type"],
@@ -48,7 +45,7 @@ class MilvusWriter:
                     "root_chunk_id": doc.get("root_chunk_id", ""),
                     "chunk_level": doc.get("chunk_level", 0),
                 }
-                for doc, dense_emb, sparse_emb in zip(batch, dense_embeddings, sparse_embeddings)
+                for doc, dense_emb in zip(batch, dense_embeddings)
             ]
 
             self.milvus_manager.insert(insert_data)
@@ -57,6 +54,3 @@ class MilvusWriter:
             if progress_callback:
                 processed = min(i + batch_size, total)
                 progress_callback(processed, total)
-
-        # 所有批次处理完成后，持久化 BM25 状态（优化：避免在循环中频繁写文件）
-        self.embedding_service.persist()

@@ -32,12 +32,19 @@ from .agent import chat_with_agent, chat_with_agent_stream, storage
 from .auth import authenticate_user, create_access_token, get_current_user, get_db, get_password_hash, require_admin, resolve_role
 from .document_loader import DocumentLoader
 from .models import User
+from .memory import (
+    delete_memory as delete_memory_record,
+    list_memories,
+    save_confirmed,
+    save_memory,
+)
 from .schemas import (
     AuthResponse, ChatRequest, ChatResponse, CurrentUserResponse,
     DocumentDeleteJobResponse, DocumentDeleteResponse, DocumentDeleteStartResponse,
     DocumentInfo, DocumentListResponse, DocumentUploadJobResponse,
     DocumentUploadResponse, DocumentUploadStartResponse,
     LoginRequest, MessageInfo, RegisterRequest,
+    MemoryConfirm, MemoryCreate, MemoryDeleteResponse, MemoryInfo, MemoryListResponse,
     SessionDeleteResponse, SessionInfo, SessionListResponse, SessionMessagesResponse,
 )
 from .embedding import embedding_service
@@ -45,6 +52,7 @@ from .milvus_client import MilvusManager
 from .milvus_writer import MilvusWriter
 from .parent_chunk_store import ParentChunkStore
 from .upload_jobs import DELETE_STEPS, delete_job_manager, upload_job_manager
+from .task_queue import task_queue
 
 # 日志配置
 LOG_DIR = Path(__file__).resolve().parent.parent / "data" / "logs"
@@ -93,17 +101,65 @@ def _decode_upload_filename(name: str) -> str:
     return name
 
 
+# 上传文件大小上限（默认 200MB）：防止恶意/误传大文件撑爆磁盘
+MAX_UPLOAD_BYTES = int(os.getenv("MAX_UPLOAD_MB", "200")) * 1024 * 1024
+_CHUNK_BYTES = 1024 * 1024
+
+
+def _safe_filename(name: str) -> str:
+    """
+    净化文件名，杜绝路径穿越（../../etc/passwd）与目录分隔符写入。
+    仅保留 basename，并剔除控制字符。
+    """
+    if not name:
+        return "unnamed"
+    # Path().name 对 "a/b" 取 "b"；对 "" 返回 ""；Windows 下也处理反斜杠
+    base = Path(name.replace("\\", "/")).name
+    # 去掉 basename 之后残留的非法字符
+    base = re.sub(r'[<>:"|?*\x00-\x1f]', "_", base).strip()
+    return base or "unnamed"
+
+
+async def _save_upload_stream(file: UploadFile, dest_dir: Path, filename: str) -> Path:
+    """
+    统一的上传落盘函数：流式分块写入 + 大小限制 + uuid 前缀隔离。
+
+    - 大小超限立即中断并抛 HTTPException(413)，避免无谓占用磁盘与带宽
+    - 磁盘名加 uuid 前缀，避免并发/重复上传同名文件互相覆盖
+    - 文件名经 _safe_filename 净化，杜绝路径穿越
+
+    :return: 实际落盘路径
+    """
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    file_path = dest_dir / f"{uuid.uuid4().hex[:8]}_{_safe_filename(filename)}"
+    written = 0
+    try:
+        with open(file_path, "wb") as f:
+            while True:
+                chunk = await file.read(_CHUNK_BYTES)
+                if not chunk:
+                    break
+                written += len(chunk)
+                if written > MAX_UPLOAD_BYTES:
+                    raise HTTPException(
+                        status_code=413,
+                        detail=f"文件超过大小上限 {MAX_UPLOAD_BYTES // (1024 * 1024)}MB",
+                    )
+                f.write(chunk)
+    except HTTPException:
+        # 超限：清理半截文件后抛出
+        try:
+            file_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        raise
+    return file_path
+
+
 async def _save_chatter_upload(file: UploadFile, filename: str):
     """保存上传文件到独立临时子目录（uuid 隔离），避免并发上传同名文件互相删除导致 503。"""
     req_dir = CHATTER_DATA_DIR / uuid.uuid4().hex
-    req_dir.mkdir(parents=True, exist_ok=True)
-    file_path = req_dir / filename
-    with open(file_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    file_path = await _save_upload_stream(file, req_dir, filename)
     return file_path, req_dir
 
 _DIAG_LOG_PATH = Path(__file__).resolve().parent.parent / "data" / "logs" / "upload_diag.log"
@@ -127,14 +183,13 @@ milvus_manager = MilvusManager()
 milvus_writer = MilvusWriter(embedding_service=embedding_service, milvus_manager=milvus_manager)
 
 
-def _remove_bm25_stats_for_filename(filename: str) -> None:
-    """删除 Milvus 中该文件对应 chunk 前，先从持久化 BM25 统计中扣减。"""
-    rows = milvus_manager.query_all(
-        filter_expr=f'filename == "{filename}"',
-        output_fields=["text"],
-    )
-    texts = [r.get("text") or "" for r in rows]
-    embedding_service.increment_remove_documents(texts)
+def _refresh_bm25_stats_after_delete() -> None:
+    """删除数据后刷新 Milvus 段：内置 BM25 的文档频率随段构建统计，
+    flush 使删除尽快生效（统计完全一致需 compact，工程上可接受）。"""
+    try:
+        milvus_manager.flush()
+    except Exception:
+        pass
 
 router = APIRouter()
 
@@ -144,19 +199,19 @@ UPLOAD_DIR_IMAGES = DATA_DIR / "images"
 @router.post("/upload/image")
 async def upload_image(file: UploadFile = File(...), current_user: User = Depends(get_current_user)):
     """上传图片文件"""
-    filename = file.filename or "image.png"
+    filename = _decode_upload_filename(file.filename or "image.png")
     if not filename.lower().endswith((".png", ".jpg", ".jpeg", ".gif", ".bmp", ".webp")):
         raise HTTPException(status_code=400, detail="仅支持图片格式（PNG/JPG/GIF/BMP/WEBP）")
-    os.makedirs(UPLOAD_DIR_IMAGES, exist_ok=True)
-    file_path = UPLOAD_DIR_IMAGES / filename
     try:
-        with open(file_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
-        return {"filename": filename, "path": str(file_path), "message": "图片上传成功"}
+        # 统一落盘：路径净化 + 大小限制 + uuid 前缀隔离（避免路径穿越与同名覆盖）
+        file_path = await _save_upload_stream(file, UPLOAD_DIR_IMAGES, filename)
+        return {
+            "filename": file_path.name,
+            "path": str(file_path),
+            "message": "图片上传成功",
+        }
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"图片保存失败: {e}")
 
@@ -227,11 +282,86 @@ async def delete_session(session_id: str, current_user: User = Depends(get_curre
         raise HTTPException(status_code=500, detail=str(e))
 
 
+@router.get("/memories", response_model=MemoryListResponse)
+async def list_memories_endpoint(current_user: User = Depends(get_current_user)):
+    """列出当前用户可见的记忆：机器级公共记忆 + 本人个人记忆"""
+    try:
+        return MemoryListResponse(memories=[MemoryInfo(**m) for m in list_memories(current_user.username)])
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/memories", response_model=MemoryInfo)
+async def create_memory_endpoint(request: MemoryCreate, current_user: User = Depends(get_current_user)):
+    """
+    写入记忆（按 name 去重，已存在则覆盖）。
+
+    机器级公共记忆（scope=machine）是全体用户共享的设备档案，仅管理员可写；
+    普通用户提交 machine 一律 403，避免学员对话污染公共档案。
+    """
+    scope = (request.scope or "personal").strip().lower()
+    if scope == "machine" and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail="仅管理员可写入机器级公共记忆")
+
+    row = save_memory(
+        user_id=None if scope == "machine" else current_user.username,
+        name=request.name,
+        body=request.body,
+        mem_type=request.mem_type,
+        scope=scope,
+        description=request.description or "",
+        created_by=current_user.username,
+    )
+    if not row:
+        raise HTTPException(status_code=400, detail="记忆写入失败：name 与 body 不能为空，或参数非法")
+    return MemoryInfo(**row)
+
+
+@router.post("/memories/confirm", response_model=MemoryInfo)
+async def confirm_memory_endpoint(request: MemoryConfirm, current_user: User = Depends(get_current_user)):
+    """
+    确认信号写入：用户标记本轮问答有效时，直接把问答存为记忆。
+
+    零 LLM 调用——不需要模型判断"这是不是持久事实"，用户的确认动作
+    本身就是判断，这是信噪比最高的写入路径。
+    """
+    row = save_confirmed(
+        user_id=current_user.username,
+        question=request.question,
+        answer=request.answer,
+        mem_type=request.mem_type,
+        name=request.name or "",
+    )
+    if not row:
+        raise HTTPException(status_code=400, detail="确认写入失败：question 与 answer 不能为空")
+    return MemoryInfo(**row)
+
+
+@router.delete("/memories/{memory_id}", response_model=MemoryDeleteResponse)
+async def delete_memory_endpoint(memory_id: int, current_user: User = Depends(get_current_user)):
+    """
+    删除记忆。
+
+    管理员可删除任意记忆（含机器级）；普通用户只能删除自己的个人记忆，
+    越权删除他人记忆或机器级记忆一律按"不存在"处理，不泄露其存在性。
+    """
+    is_admin = current_user.role == "admin"
+    deleted = delete_memory_record(
+        memory_id, owner_user_id=None if is_admin else current_user.username
+    )
+    if not deleted:
+        raise HTTPException(status_code=404, detail="记忆不存在或无权删除")
+    return MemoryDeleteResponse(id=memory_id, message="记忆已删除")
+
+
 @router.post("/chat", response_model=ChatResponse)
 async def chat_endpoint(request: ChatRequest, current_user: User = Depends(get_current_user)):
     try:
         session_id = request.session_id or "default_session"
-        resp = chat_with_agent(request.message, current_user.username, session_id)
+        # Item1: 同步阻塞调用移入线程池，避免阻塞 FastAPI 事件循环
+        resp = await asyncio.to_thread(
+            chat_with_agent, request.message, current_user.username, session_id
+        )
         if isinstance(resp, dict):
             return ChatResponse(**resp)
         return ChatResponse(response=resp)
@@ -280,12 +410,8 @@ def _is_supported_document(filename: str) -> bool:
 
 
 async def _save_upload_file(file: UploadFile, file_path: Path) -> None:
-    with open(file_path, "wb") as f:
-        while True:
-            chunk = await file.read(1024 * 1024)
-            if not chunk:
-                break
-            f.write(chunk)
+    """保存上传文档到指定路径（沿用既定 disk_name，含 uuid 前缀）。"""
+    await _save_upload_stream(file, file_path.parent, file_path.name)
 
 
 def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
@@ -307,7 +433,7 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         except Exception:
             pass
         try:
-            _remove_bm25_stats_for_filename(filename)
+            _refresh_bm25_stats_after_delete()
         except Exception:
             pass
         try:
@@ -393,13 +519,26 @@ def _process_upload_job(job_id: str, file_path: str, filename: str) -> None:
         upload_job_manager.fail_job(job_id, failed_step, str(e))
 
 
+def _process_upload_job_retryable(job_id: str, payload: dict) -> None:
+    """任务队列包装器：_process_upload_job 内部 fail_job 后不抛异常，
+    这里将"已标记失败"转为异常，让任务队列感知失败并重试。
+    重试幂等：任务开头 complete_step 会把状态从 failed 恢复为 running。"""
+    try:
+        _process_upload_job(job_id, payload["file_path"], payload["filename"])
+    except Exception:
+        raise
+    job = upload_job_manager.get_job(job_id)
+    if job and job.get("status") == "failed":
+        raise RuntimeError(job.get("message") or "上传任务失败")
+
+
 @router.get("/documents", response_model=DocumentListResponse)
 async def list_documents(_: User = Depends(require_admin)):
     try:
         milvus_manager.init_collection()
-        results = milvus_manager.query(
+        # 分页拉取全部分块（Milvus 单次 query 上限 16384，文档量大时一次性拉取会撞窗口上限）
+        results = milvus_manager.query_all(
             output_fields=["filename", "file_type"],
-            limit=10000,
         )
         file_stats = {}
         for r in results:
@@ -462,8 +601,12 @@ async def upload_document_async(file: UploadFile = File(...), _: User = Depends(
 
     print(f"[UPLOAD_DEBUG] 提交后台任务: job_id={job_id}", flush=True)
     _diag_log(job_id, f"准备启动后台任务: file_path={file_path}")
-    _job_executor.submit(_process_upload_job, job_id, str(file_path), filename)
-    _diag_log(job_id, f"后台任务已提交（线程池）")
+    task_queue.submit(
+        "upload",
+        job_id,
+        {"file_path": str(file_path), "filename": filename},
+    )
+    _diag_log(job_id, f"后台任务已提交（Redis Stream 任务队列）")
     print(f"[UPLOAD_DEBUG] 后台任务已提交: job_id={job_id}", flush=True)
 
     return DocumentUploadStartResponse(
@@ -498,8 +641,8 @@ async def delete_document_async(filename: str, _: User = Depends(require_admin))
         completion_step="graph_delete",
     )
     delete_job_manager.update_step(job["job_id"], "prepare", 1, "running", "删除任务已提交")
-    _job_executor.submit(_process_delete_job, job["job_id"], filename)
-    logger.info(f"[delete-job:{job['job_id']}] 后台删除任务已提交（线程池）")
+    task_queue.submit("delete", job["job_id"], {"filename": filename})
+    logger.info(f"[delete-job:{job['job_id']}] 后台删除任务已提交（Redis Stream 任务队列）")
     return DocumentDeleteStartResponse(
         job_id=job["job_id"],
         filename=filename,
@@ -527,9 +670,9 @@ def _process_delete_job(job_id: str, filename: str) -> None:
         delete_job_manager.complete_step(job_id, "prepare", "删除任务已创建")
 
         failed_step = "bm25"
-        delete_job_manager.update_step(job_id, "bm25", 20, "running", "正在同步 BM25 统计")
-        _remove_bm25_stats_for_filename(filename)
-        delete_job_manager.complete_step(job_id, "bm25", "BM25 统计已同步")
+        delete_job_manager.update_step(job_id, "bm25", 20, "running", "正在刷新 BM25 统计")
+        _refresh_bm25_stats_after_delete()
+        delete_job_manager.complete_step(job_id, "bm25", "BM25 统计已刷新")
 
         failed_step = "milvus"
         delete_job_manager.update_step(job_id, "milvus", 30, "running", "正在删除 Milvus 向量数据")
@@ -560,6 +703,22 @@ def _process_delete_job(job_id: str, filename: str) -> None:
     except Exception as e:
         logger.exception(f"[delete-job:{job_id}] 删除任务失败: {e}")
         delete_job_manager.fail_job(job_id, failed_step, str(e))
+
+
+def _process_delete_job_retryable(job_id: str, payload: dict) -> None:
+    """任务队列包装器：将 _process_delete_job 内部标记失败转为异常，供任务队列重试。"""
+    try:
+        _process_delete_job(job_id, payload["filename"])
+    except Exception:
+        raise
+    job = delete_job_manager.get_job(job_id)
+    if job and job.get("status") == "failed":
+        raise RuntimeError(job.get("message") or "删除任务失败")
+
+
+# 注册任务队列处理器（Redis Stream 调度 + 失败重试；Redis 不可用时自动降级线程池）
+task_queue.register_handler("upload", _process_upload_job_retryable)
+task_queue.register_handler("delete", _process_delete_job_retryable)
 
 
 
@@ -861,11 +1020,13 @@ async def kg_stats_endpoint(_: User = Depends(get_current_user)):
 async def kg_import_triples_endpoint(
     file: UploadFile = File(...),
     llm_validate: bool = Form(True),
-    current_user: User = Depends(get_current_user),
+    _: User = Depends(require_admin),
 ):
     """
     导入人工/专家三元组文件（Upload 命名空间），兼容 .json（数组）/ .jsonl 两种格式。
     文件会保存到 kg/data/triples/ 目录（重建图谱后仍保留）。
+
+    仅管理员可调用：该文件会持久落盘并污染知识库，普通用户不应具备写图谱权限。
     """
     filename = _decode_upload_filename(file.filename or "triples.json")
     ext = os.path.splitext(filename)[1].lower()
@@ -874,15 +1035,9 @@ async def kg_import_triples_endpoint(
     try:
         from kg.graph_service import graph_service
         service = graph_service
-        triples_dir = service.store.triples_dir
-        os.makedirs(triples_dir, exist_ok=True)
-        file_path = os.path.join(triples_dir, filename)
-        with open(file_path, "wb") as f:
-            while True:
-                chunk = await file.read(1024 * 1024)
-                if not chunk:
-                    break
-                f.write(chunk)
+        triples_dir = Path(service.store.triples_dir)
+        # 统一落盘：路径净化 + 大小限制（防止写入任意路径）
+        file_path = await _save_upload_stream(file, triples_dir, filename)
         service.ensure_ready()
         result = service.import_triples_file(file_path, llm_validate=llm_validate)
         # 同步写入 Neo4j 统一图谱（Entity:Upload），使手工三元组在 graphkb 中可检索

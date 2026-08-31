@@ -7,6 +7,7 @@ from langgraph.graph import StateGraph, END
 from pydantic import BaseModel, Field
 
 from .rag_utils import retrieve_documents, step_back_expand, generate_hypothetical_document
+from .answerability import evaluate as evaluate_answerability
 from .tools import emit_rag_step
 
 load_dotenv(dotenv_path=Path(__file__).resolve().parent.parent / ".env")
@@ -389,7 +390,7 @@ rag_graph = build_rag_graph()
 
 
 def run_rag_graph(question: str) -> dict:
-    return rag_graph.invoke({
+    result = rag_graph.invoke({
         "question": question,
         "query": question,
         "context": "",
@@ -402,3 +403,10 @@ def run_rag_graph(question: str) -> dict:
         "hypothetical_doc": None,
         "rag_trace": None,
     })
+    # Answerability 门控（零额外 LLM）：基于最终检索结果判定，随 rag_trace 一起暴露
+    docs = result.get("docs") or []
+    gate = evaluate_answerability(docs, question)
+    result["answerability"] = gate
+    if isinstance(result.get("rag_trace"), dict):
+        result["rag_trace"]["answerability"] = gate
+    return result

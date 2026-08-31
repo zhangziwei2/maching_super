@@ -1,23 +1,38 @@
 from dotenv import load_dotenv
+import contextvars
+import logging
 import os
 import json
 import asyncio
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from langchain_openai import ChatOpenAI
 from langchain_core.messages import HumanMessage, AIMessage, SystemMessage
 from .tools import (
     search_knowledge_base,
     query_knowledge_graph,
-    web_search,
     emit_rag_step,
     set_rag_step_queue,
+    set_request_identity,
     get_last_rag_context,
     reset_tool_call_guards,
 )
+from .Intent_router import IntentRouter
+from .context_compact import archive_transcript, compact_history
+from .hooks import trigger_hooks
+from .hooks_builtin import register_builtin_hooks
 from datetime import datetime
 from .cache import cache
 from .database import SessionLocal
 from .models import User, ChatSession, ChatMessage
+
+logger = logging.getLogger(__name__)
+
+# 复用线程池：避免每次对话创建/销毁线程（原实现每次请求新建 ThreadPoolExecutor）
+_retrieval_executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="retrieval")
+
+# 注册内置钩子（可回答性门控、检索完成进度）
+register_builtin_hooks()
 
 # 显式从 maching 项目目录加载 .env（不依赖 CWD）
 _env_path = Path(__file__).resolve().parent.parent / '.env'
@@ -55,8 +70,26 @@ class ConversationStorage:
                 messages.append(SystemMessage(content=content))
         return messages
 
-    def save(self, user_id: str, session_id: str, messages: list, metadata: dict = None, extra_message_data: list = None):
-        """保存对话"""
+    def save(self, user_id: str, session_id: str, messages: list, metadata: dict = None,
+             extra_message_data: list = None, last_message_extra: dict = None,
+             on_archive: callable = None):
+        """
+        保存对话 —— 增量写入。
+
+        相较此前的「删除全部 + 全量重写」：
+        - 仅重写与库中不一致的尾部（公共前缀保留原样），写入量由 O(总消息数) 降为 O(新增数)
+        - 保留历史消息原始的 timestamp 与 rag_trace（此前每轮重写都会把旧消息 trace 置空、
+          timestamp 刷新为当前时间）
+        - 被替换/丢弃的历史消息在删除前交给 on_archive 回调，供上下文压缩归档 transcript，
+          使压缩从「不可逆销毁」变为「移出主上下文但可追溯」
+
+        :param last_message_extra: 附加到最后一条消息的额外字段，如 {"rag_trace": {...}}
+        :param extra_message_data: 按消息下标对齐的额外字段列表（旧接口，优先级低于 last_message_extra）
+        :param on_archive: callable(user_id, session_id, dropped_records)，删除旧消息前调用
+        """
+        if last_message_extra and messages:
+            extra_message_data = [None] * (len(messages) - 1) + [last_message_extra]
+
         db = SessionLocal()
         try:
             user = db.query(User).filter(User.username == user_id).first()
@@ -75,15 +108,60 @@ class ConversationStorage:
             else:
                 session.metadata_json = metadata or {}
 
-            db.query(ChatMessage).filter(ChatMessage.session_ref_id == session.id).delete(synchronize_session=False)
+            # --- 增量写入：计算与库中消息的公共前缀 ---
+            existing = (
+                db.query(ChatMessage)
+                .filter(ChatMessage.session_ref_id == session.id)
+                .order_by(ChatMessage.id.asc())
+                .all()
+            )
+            common = 0
+            for old, new in zip(existing, messages):
+                if old.message_type != new.type or old.content != str(new.content):
+                    break
+                common += 1
 
-            serialized = []
+            dropped = existing[common:]
+            if dropped:
+                # 删除前先归档（上下文压缩的可追溯性依赖此回调）
+                if on_archive:
+                    on_archive(
+                        user_id,
+                        session_id,
+                        [
+                            {
+                                "type": r.message_type,
+                                "content": r.content,
+                                "timestamp": r.timestamp.isoformat(),
+                                "rag_trace": r.rag_trace,
+                            }
+                            for r in dropped
+                        ],
+                    )
+                drop_ids = [r.id for r in dropped]
+                db.query(ChatMessage).filter(ChatMessage.id.in_(drop_ids)).delete(
+                    synchronize_session=False
+                )
+
             now = datetime.utcnow()
-            for idx, msg in enumerate(messages):
+            serialized = []
+            # 公共前缀：沿用库中原始的 timestamp 与 rag_trace
+            for row in existing[:common]:
+                serialized.append(
+                    {
+                        "type": row.message_type,
+                        "content": row.content,
+                        "timestamp": row.timestamp.isoformat(),
+                        "rag_trace": row.rag_trace,
+                    }
+                )
+
+            # 新增/重写部分
+            for idx in range(common, len(messages)):
+                msg = messages[idx]
                 rag_trace = None
                 if extra_message_data and idx < len(extra_message_data):
-                    extra = extra_message_data[idx] or {}
-                    rag_trace = extra.get("rag_trace")
+                    rag_trace = (extra_message_data[idx] or {}).get("rag_trace")
 
                 db.add(
                     ChatMessage(
@@ -106,6 +184,7 @@ class ConversationStorage:
             session.updated_at = now
             db.commit()
 
+            # 缓存必须与库同步刷新，否则压缩/追加后 load 仍会读到旧历史
             cache.set_json(self._messages_cache_key(user_id, session_id), serialized)
             cache.delete(self._sessions_cache_key(user_id))
         finally:
@@ -238,19 +317,7 @@ SYSTEM_PROMPT = (
     "- 禁止编造事实，不知道就诚实说明。"
 )
 
-_SUFFICIENCY_PROMPT = """你是一个信息判官。判断以下「参考资料」是否足以完整回答「用户问题」。
 
-用户问题：{question}
-
-参考资料：
-{context}
-
-规则：
-1. 如果参考资料提供了足够的信息来完整回答问题 → 输出：SUFFICIENT
-2. 如果参考资料完全为空 → 输出：SUFFICIENT（让模型自行发挥）
-3. 如果信息明显缺失，或需要查询最新标准/外部数据 → 输出：NEEDS_WEB|搜索关键词
-
-现在请判断："""
 
 
 def _create_llm(temperature: float = 0.3):
@@ -277,29 +344,37 @@ def _search_kg(query: str) -> str:
         result = query_knowledge_graph.invoke(query)
         return (result or "").strip()
     except Exception as e:
+        # 图谱加载失败/服务异常必须留痕，否则表现为"答非所问"难以排查
+        logger.warning(f"[_search_kg] 知识图谱检索失败: {e}", exc_info=True)
         return ""
 
 
-def _search_rag(query: str) -> str:
-    """同步查询文档知识库"""
+def _search_rag(query: str):
+    """
+    同步查询文档知识库，返回 (检索文本, answerability 门控 dict, rag_trace dict)
+
+    注意：rag_trace 在此处就地取出并随返回值上抛，而不是留给调用方用
+    get_last_rag_context() 再读一次——因为检索可能运行在 copy_context() 派生的
+    子上下文里，其中的 ContextVar 赋值不会回传主上下文。
+    """
     emit_rag_step("📄", "文档知识库检索")
     try:
         result = search_knowledge_base.invoke(query)
+        # 从工具侧 rag_trace 中读取 answerability 判定与 trace（不清理，保持原消费语义）
+        gate, trace = {}, None
+        try:
+            ctx = get_last_rag_context(clear=False) or {}
+            trace = ctx.get("rag_trace") or None
+            gate = (trace or {}).get("answerability") or {}
+        except Exception:
+            pass
         if "No relevant documents" in result or "TOOL_CALL_LIMIT" in result:
-            return ""
-        return result.strip()
+            return "", gate, trace
+        return result.strip(), gate, trace
     except Exception as e:
-        return ""
-
-
-def _search_web(query: str) -> str:
-    """同步联网搜索"""
-    emit_rag_step("🌐", "联网搜索", f"查询：{query[:60]}")
-    try:
-        result = web_search.invoke(query)
-        return (result or "").strip()
-    except Exception as e:
-        return ""
+        # Milvus 不可达 / embedding 服务未启动等故障必须可观测
+        logger.warning(f"[_search_rag] 文档知识库检索失败: {e}", exc_info=True)
+        return "", {}, None
 
 
 def _build_context(kg_result: str, rag_result: str) -> str:
@@ -312,49 +387,119 @@ def _build_context(kg_result: str, rag_result: str) -> str:
     return "\n\n".join(parts)
 
 
-def _eval_sufficiency(question: str, context: str, llm: ChatOpenAI) -> tuple[bool, str]:
-    """判断是否需要进行联网搜索。返回 (需要搜索?, 搜索关键词)"""
-    if not context:
-        return False, question
+def _prepare_history(user_id: str, session_id: str) -> list:
+    """
+    加载历史消息并按 L2→L3→L4 逐级压缩（同步/流式共用）。
 
-    prompt = _SUFFICIENCY_PROMPT.format(question=question, context=context)
-    try:
-        resp = llm.invoke([SystemMessage(content=prompt)], temperature=0.0, max_tokens=100)
-        result = resp.content.strip()
-        if result.startswith("NEEDS_WEB"):
-            query = result.split("|", 1)[1].strip() if "|" in result else question
-            return True, query
-    except Exception:
-        pass
-    return False, question
+    替换原先「按条数 >50 就摘要」的粗放策略：改为按字符预算触发，
+    且被裁剪的内容由 storage.save 的 on_archive 回调归档，不再不可逆丢失。
+    """
+    messages = storage.load(user_id, session_id)
+    return compact_history(
+        messages,
+        user_id,
+        session_id,
+        summarizer=_summarize_messages,
+        before_drop=_memory_before_drop,
+    )
+
+
+def _memory_before_drop(user_id: str, old_messages: list) -> None:
+    """
+    L4 丢弃前的记忆兜底（s08 → s09 接口点）。
+
+    压缩即将用摘要替换掉这部分原始对话，先让记忆系统把持久事实接住，
+    否则"主轴型号 BT40"这类信息丢了，下一轮门控会误判依据不足。
+    """
+    from .memory import extract_from_messages
+
+    extract_from_messages(user_id, old_messages, trigger="compact")
+
+
+def _retrieve_by_route(user_text: str, route: str):
+    """
+    按意图路由检索，返回 (kg_result, rag_result, rag_gate, rag_trace)。
+
+    hybrid 时 KG + RAG 并发，单个 future 限时 45s，防止任一检索源挂死拖住整条链路；
+    并发子任务经 copy_context 携带当前 ContextVar 快照，保证请求间互不串号。
+    """
+    kg_result, rag_result, rag_gate, rag_trace = "", "", {}, None
+    if route == "kg":
+        emit_rag_step("🔍", "知识图谱检索")
+        kg_result = _search_kg(user_text)
+    elif route == "rag":
+        emit_rag_step("📄", "文档知识库检索")
+        rag_result, rag_gate, rag_trace = _search_rag(user_text)
+    else:
+        emit_rag_step("🔍", "知识图谱检索")
+        emit_rag_step("📄", "文档知识库检索")
+        ctx = contextvars.copy_context()
+        kg_future = _retrieval_executor.submit(ctx.run, _search_kg, user_text)
+        rag_future = _retrieval_executor.submit(ctx.run, _search_rag, user_text)
+        kg_result = kg_future.result(timeout=45)
+        rag_result, rag_gate, rag_trace = rag_future.result(timeout=45)
+    return kg_result, rag_result, rag_gate, rag_trace
+
+
+def _prepare_answer(user_text: str, user_id: str, session_id: str):
+    """
+    公共准备流程（同步/流式共用）：历史加载 → 意图路由 → 检索 → 可回答性门控。
+
+    抽出该函数的目的：后续新增横切能力（上下文压缩、记忆注入、Hooks）
+    只需在此处改一次，不必同步/流式各改一遍。
+
+    :return: (messages, context, rejection, rag_trace)
+             rejection 非 None 时应直接输出拒答文案，不再调用 LLM
+    """
+    # 每轮对话重置工具调用计数，避免跨轮次累积导致 RAG 检索被误判为超限
+    reset_tool_call_guards()
+
+    messages = _prepare_history(user_id, session_id)
+
+    # --- Hook: UserPromptSubmit —— 返回 str 则直接作答，跳过检索与生成
+    shortcut = trigger_hooks("UserPromptSubmit", user_text, user_id, session_id)
+    if shortcut is not None:
+        return messages, "", shortcut, None
+
+    # Item 4: 意图路由（纯规则，零额外 LLM）——命中单通道仅启用该通道，未命中/双命中则并发
+    route = IntentRouter().route(user_text)["route"]
+
+    # --- Hook: PreRetrieve —— 返回 str 则替换检索 query
+    query = trigger_hooks("PreRetrieve", user_text, route) or user_text
+
+    kg_result, rag_result, rag_gate, rag_trace = _retrieve_by_route(query, route)
+
+    # --- Hook: PostRetrieve —— 可回答性门控挂此处，返回 str 则作为拒答文案短路
+    rejection = trigger_hooks("PostRetrieve", user_text, kg_result, rag_result, rag_gate)
+
+    return messages, _build_context(kg_result, rag_result), rejection, rag_trace
 
 
 def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: str = "default_session"):
-    """自动模式（非流式）：KG+RAG 并发 → 按需 Web → LLM 回答"""
-    # 每轮对话重置工具调用计数，避免跨轮次累积导致 RAG 检索被误判为超限
-    reset_tool_call_guards()
-    messages = storage.load(user_id, session_id)
-    if len(messages) > 50:
-        summary = _summarize_messages(messages[:40])
-        messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
+    """自动模式（非流式）：KG/RAG 按路由检索 → 门控 → LLM 回答"""
+    # 记录请求身份：Stop 钩子的记忆抽取需要 user_id 做多用户隔离
+    set_request_identity(user_id, session_id)
 
-    # 并发 KG + RAG（限时 45s，防止任一检索源挂死拖住整条链路）
-    import concurrent.futures
-    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
-        kg_future = pool.submit(_search_kg, user_text)
-        rag_future = pool.submit(_search_rag, user_text)
-        kg_result = kg_future.result(timeout=45)
-        rag_result = rag_future.result(timeout=45)
+    messages, context, rejection, rag_trace = _prepare_answer(user_text, user_id, session_id)
 
-    context = _build_context(kg_result, rag_result)
+    if rejection:
+        messages.append(HumanMessage(content=user_text))
+        messages.append(AIMessage(content=rejection))
+        # rag_trace 落库：门控拒答同样可审计（此前恒为 None，全链路 trace 断链）
+        storage.save(
+            user_id, session_id, messages,
+            last_message_extra={"rag_trace": rag_trace},
+            on_archive=archive_transcript,
+        )
+        return {"response": rejection, "rag_trace": rag_trace}
+
+    # --- Hook: PreGenerate —— 返回 str 则替换注入 LLM 的 context
+    # （上下文压缩 L1、记忆注入等横切能力挂此处，无需改动主流程）
+    prepared = trigger_hooks("PreGenerate", user_text, context, messages, user_id, session_id)
+    if isinstance(prepared, str):
+        context = prepared
+
     llm = _create_llm()
-
-    # 按需 Web
-    needs_web, search_query = _eval_sufficiency(user_text, context, llm)
-    if needs_web:
-        web_result = _search_web(search_query)
-        if web_result:
-            context += f"\n\n【联网搜索结果】\n{web_result}"
 
     # 构建最终 prompt
     if context:
@@ -375,10 +520,23 @@ def chat_with_agent(user_text: str, user_id: str = "default_user", session_id: s
     response = llm.invoke(full_messages)
     response_content = response.content
 
-    messages.append(AIMessage(content=response_content))
-    storage.save(user_id, session_id, messages)
+    # --- Hook: PostGenerate —— 返回 str 则替换最终答案
+    generated = trigger_hooks("PostGenerate", user_text, response_content)
+    if isinstance(generated, str):
+        response_content = generated
 
-    return {"response": response_content, "rag_trace": None}
+    messages.append(AIMessage(content=response_content))
+    # rag_trace 落库：使 retrieve/rewrite/rerank/merge 各阶段指标贯穿存储层到前端
+    storage.save(
+        user_id, session_id, messages,
+        last_message_extra={"rag_trace": rag_trace},
+        on_archive=archive_transcript,
+    )
+
+    # --- Hook: Stop —— 副作用（记忆抽取、审计统计），返回值忽略
+    trigger_hooks("Stop", user_text, response_content, rag_trace)
+
+    return {"response": response_content, "rag_trace": rag_trace}
 
 
 def _summarize_messages(messages: list) -> str:
@@ -399,8 +557,12 @@ async def chat_with_agent_stream(
 ):
     """
     自动模式（流式）：
-    KG + RAG 并发 → LLM 评估信息充分性 → 按需 Web → 流式输出最终回答
+    KG / RAG 按路由检索 → 可回答性门控 → 流式输出最终回答
     """
+    # 记录请求身份：必须在 copy_context() 之前设置，否则子上下文里的赋值
+    # 不会回传，主上下文触发的 Stop 钩子读不到 user_id（记忆会写到空用户名下）
+    set_request_identity(user_id, session_id)
+
     # 每轮对话重置工具调用计数，避免跨轮次累积导致 RAG 检索被误判为超限
     reset_tool_call_guards()
     # --- 设置 RAG 步骤队列 ---
@@ -412,37 +574,36 @@ async def chat_with_agent_stream(
 
     set_rag_step_queue(_RagStepProxy())
 
-    # --- 加载历史 ---
-    messages = storage.load(user_id, session_id)
-    if len(messages) > 50:
-        summary = _summarize_messages(messages[:40])
-        messages = [SystemMessage(content=f"之前的对话摘要：\n{summary}")] + messages[40:]
-
-    # --- 并发 KG + RAG（在后台线程执行，避免阻塞事件循环）---
+    # --- 公共准备流程：历史加载 → 意图路由 → 检索 → 可回答性门控 ---
+    # 整体提交到线程池，避免阻塞事件循环；ctx.run 把当前请求的 ContextVar
+    # 快照带入工作线程，保证步骤队列与检索上下文在并发请求间不串号
     loop = asyncio.get_running_loop()
-
-    emit_rag_step("🔍", "知识图谱检索")
-    emit_rag_step("📄", "文档知识库检索")
-
-    async def _run_kg():
-        return await loop.run_in_executor(None, _search_kg, user_text)
-
-    async def _run_rag():
-        return await loop.run_in_executor(None, _search_rag, user_text)
-
-    # 限时 45s：防止任一检索源挂死拖住整条流式链路
-    kg_result, rag_result = await asyncio.wait_for(
-        asyncio.gather(_run_kg(), _run_rag()), timeout=45
+    ctx = contextvars.copy_context()
+    messages, context, rejection, rag_trace = await loop.run_in_executor(
+        _retrieval_executor, ctx.run, _prepare_answer, user_text, user_id, session_id
     )
-    context = _build_context(kg_result, rag_result)
 
-    # --- 评估是否需要 Web 搜索 ---
+    if rejection:
+        messages.append(HumanMessage(content=user_text))
+        messages.append(AIMessage(content=rejection))
+        # rag_trace 落库：门控拒答同样可审计
+        storage.save(
+            user_id, session_id, messages,
+            last_message_extra={"rag_trace": rag_trace},
+            on_archive=archive_transcript,
+        )
+        set_rag_step_queue(None)
+        yield f"data: {json.dumps({'type': 'content', 'content': rejection})}\n\n"
+        yield "data: [DONE]\n\n"
+        return
+
+    # --- Hook: PreGenerate —— 返回 str 则替换注入 LLM 的 context
+    # （上下文压缩 L1、记忆注入等横切能力挂此处，无需改动主流程）
+    prepared = trigger_hooks("PreGenerate", user_text, context, messages, user_id, session_id)
+    if isinstance(prepared, str):
+        context = prepared
+
     llm = _create_llm()
-    needs_web, search_query = _eval_sufficiency(user_text, context, llm)
-    if needs_web:
-        web_result = await loop.run_in_executor(None, _search_web, search_query)
-        if web_result:
-            context += f"\n\n【联网搜索结果】\n{web_result}"
 
     # --- 构建最终消息 ---
     if context:
@@ -508,7 +669,21 @@ async def chat_with_agent_stream(
 
     yield "data: [DONE]\n\n"
 
+    # --- Hook: PostGenerate —— 返回 str 则替换最终答案（流式下仅影响入库内容，
+    # 已推送给前端的分片无法撤回，故此钩子在流式链路主要用于记录与净化入库文本）
+    generated = trigger_hooks("PostGenerate", user_text, full_response)
+    if isinstance(generated, str):
+        full_response = generated
+
     # --- 保存对话 ---
     messages.append(HumanMessage(content=user_text))
     messages.append(AIMessage(content=full_response))
-    storage.save(user_id, session_id, messages)
+    # rag_trace 落库：使各阶段指标贯穿存储层到前端（此前恒为 None）
+    storage.save(
+        user_id, session_id, messages,
+        last_message_extra={"rag_trace": rag_trace},
+        on_archive=archive_transcript,
+    )
+
+    # --- Hook: Stop —— 副作用（记忆抽取、审计统计），返回值忽略
+    trigger_hooks("Stop", user_text, full_response, rag_trace)

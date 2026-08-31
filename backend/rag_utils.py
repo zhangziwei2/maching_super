@@ -110,7 +110,9 @@ def _auto_merge_documents(docs: List[dict], top_k: int) -> Tuple[List[dict], Dic
 def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[dict], Dict[str, Any]]:
     docs_with_rank = [{**doc, "rrf_rank": i} for i, doc in enumerate(docs, 1)]
     meta: Dict[str, Any] = {
-        "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+        # 本地 FlashRank 等自建重排服务无需 API key，故启用条件只要求模型+端点；
+        # 仅当配置了 key 时才发送 Authorization 头。
+        "rerank_enabled": bool(RERANK_MODEL and RERANK_BINDING_HOST),
         "rerank_applied": False,
         "rerank_model": RERANK_MODEL,
         "rerank_endpoint": _get_rerank_endpoint(),
@@ -128,10 +130,9 @@ def _rerank_documents(query: str, docs: List[dict], top_k: int) -> Tuple[List[di
         "return_documents": False,
     }
 
-    headers = {
-        "Content-Type": "application/json",
-        "Authorization": f"Bearer {RERANK_API_KEY}",
-    }
+    headers = {"Content-Type": "application/json"}
+    if RERANK_API_KEY:
+        headers["Authorization"] = f"Bearer {RERANK_API_KEY}"
     try:
         meta["rerank_applied"] = True
         response = requests.post(
@@ -250,11 +251,10 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
     try:
         dense_embeddings = _embedding_service.get_embeddings([query])
         dense_embedding = dense_embeddings[0]
-        sparse_embedding = _embedding_service.get_sparse_embedding(query)
 
         retrieved = _milvus_manager.hybrid_retrieve(
             dense_embedding=dense_embedding,
-            sparse_embedding=sparse_embedding,
+            query_text=query,  # Milvus 内置 BM25 Function 生成稀疏查询向量
             top_k=candidate_k,
             filter_expr=filter_expr,
         )
@@ -285,7 +285,7 @@ def retrieve_documents(query: str, top_k: int = 5) -> Dict[str, Any]:
             return {
                 "docs": [],
                 "meta": {
-                    "rerank_enabled": bool(RERANK_MODEL and RERANK_API_KEY and RERANK_BINDING_HOST),
+                    "rerank_enabled": bool(RERANK_MODEL and RERANK_BINDING_HOST),
                     "rerank_applied": False,
                     "rerank_model": RERANK_MODEL,
                     "rerank_endpoint": _get_rerank_endpoint(),
