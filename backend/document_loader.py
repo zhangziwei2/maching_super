@@ -2,7 +2,18 @@
 import os
 from typing import Dict, List
 from langchain_text_splitters import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, Docx2txtLoader, UnstructuredExcelLoader
+from langchain_community.document_loaders import PyPDFLoader, UnstructuredExcelLoader
+
+# 注意：Docx2txtLoader 已被 langchain 标记 deprecated，且在 Windows + 中文路径下
+# 其 __init__ 内的 `os.path.isfile` 校验会误判已存在的中文路径文件为无效，
+# 抛出 "File path ... is not a valid file or url"。故 .docx 改用底层 docx2txt 库直接读文本，
+# 绕过该校验，对中文路径稳定。导入失败时回退到 Docx2txtLoader。
+try:
+    import docx2txt
+    _HAVE_DOCX2TXT = True
+except Exception:  # noqa: BLE001
+    from langchain_community.document_loaders import Docx2txtLoader  # type: ignore
+    _HAVE_DOCX2TXT = False
 
 
 class DocumentLoader:
@@ -128,18 +139,37 @@ class DocumentLoader:
 
         if file_lower.endswith(".pdf"):
             doc_type = "PDF"
-            loader = PyPDFLoader(file_path)
+            raw_docs = PyPDFLoader(file_path).load()
         elif file_lower.endswith((".docx", ".doc")):
             doc_type = "Word"
-            loader = Docx2txtLoader(file_path)
+            # 注意：Windows 下 os.path.isfile 对中文路径可能误报 False（文件系统编码问题），
+            # 故不预检，直接尝试读取；若文件真不存在由 docx2txt/open 抛出准确异常。
+            fs_path = os.fspath(file_path)
+            if _HAVE_DOCX2TXT:
+                try:
+                    text = docx2txt.process(fs_path) or ""
+                except Exception as _e:  # noqa: BLE001
+                    # 读取失败：打印目录实际内容，区分"文件真不存在"与"解析库报错"
+                    try:
+                        dir_listing = os.listdir(os.path.dirname(os.path.abspath(fs_path)))
+                    except Exception as _le:  # noqa: BLE001
+                        dir_listing = f"<无法列出目录: {_le}>"
+                    raise RuntimeError(
+                        f"解析 Word 文档失败: {fs_path}\n"
+                        f"所在目录实际文件: {dir_listing}\n"
+                        f"原始错误: {_e}"
+                    )
+                from langchain_core.documents import Document
+                raw_docs = [Document(page_content=text, metadata={"page": 0, "source": fs_path})]
+            else:  # 回退路径
+                raw_docs = Docx2txtLoader(file_path).load()
         elif file_lower.endswith((".xlsx", ".xls")):
             doc_type = "Excel"
-            loader = UnstructuredExcelLoader(file_path)
+            raw_docs = UnstructuredExcelLoader(file_path).load()
         else:
             raise ValueError(f"不支持的文件类型: {filename}")
 
         try:
-            raw_docs = loader.load()
             documents = []
             page_global_chunk_idx = 0
             for doc in raw_docs:

@@ -105,8 +105,10 @@ class MilvusManager:
                 schema.add_field("sparse_embedding", DataType.SPARSE_FLOAT_VECTOR)
 
                 # 文本字段：开启 analyzer，作为 BM25 Function 的输入
+                # 注意：Milvus VARCHAR 的 max_length 按 UTF-8 字节数计算，非字符数。
+                # 中文每字占 3 字节，故 2000 字符上限需 ~6000 字节；此处取 8192 留足余量。
                 schema.add_field(
-                    "text", DataType.VARCHAR, max_length=2000,
+                    "text", DataType.VARCHAR, max_length=8192,
                     enable_analyzer=True, analyzer_params=_BM25_ANALYZER_PARAMS,
                 )
                 schema.add_field("filename", DataType.VARCHAR, max_length=255)

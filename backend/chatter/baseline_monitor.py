@@ -120,6 +120,20 @@ def _get_direction(value: float, mean: float) -> str:
 
 # ==================== 核心函数 ====================
 
+def _plot_signal_for(csv_path, sig):
+    """为给定 CSV 生成 4×1 信号图（v3.1），返回保存路径或 None。
+
+    实现复用 chatter_diagnosis_skill._plot_signal_for，避免两处维护同一逻辑。
+    绘图失败只返回 None，不抛异常——信号图是附属产物，不应阻断监控流程。
+    """
+    try:
+        from .chatter_diagnosis_skill import _plot_signal_for as _impl
+        return _impl(csv_path, sig)
+    except Exception as exc:
+        print(f"[baseline_monitor] 信号图生成失败（不影响监控）: {exc}")
+        return None
+
+
 def baseline_status() -> dict:
     """
     查询基线状态。
@@ -402,6 +416,9 @@ def monitor_csv(csv_path: str) -> str:
     result = read_and_validate_csv(csv_path)
     if "error" in result:
         return f"⚠️ {result['error']}"
+
+    # 【v3.1】读入即绘制 4×1 原始信号图（先于监控报告生成）
+    _plot_signal_for(csv_path, result)
 
     sig = result
     segments = segment_signal(

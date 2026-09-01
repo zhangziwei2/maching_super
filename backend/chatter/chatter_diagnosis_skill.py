@@ -772,6 +772,20 @@ def diagnose_comprehensive(csv_path: str, long_segment_size: int = SEGMENT_SIZE)
     return '\n'.join(report)
 
 
+def _plot_signal_for(csv_path, sig):
+    """为给定 CSV 生成 4×1 信号图，返回保存路径或 None（v3.1）。
+
+    图与原始 CSV 同目录，命名 <stem>_signal.png。
+    绘图失败只返回 None，不抛异常——信号图是附属产物，不应阻断诊断。
+    """
+    try:
+        from .signal_plot import plot_signal_file
+        return plot_signal_file(csv_path, sig)
+    except Exception as exc:
+        print(f"[chatter] 信号图生成失败（不影响诊断）: {exc}")
+        return None
+
+
 # ==================== 主入口 (支持多模式) ====================
 def diagnose_csv(csv_path: str, long_segment_size: int = SEGMENT_SIZE, mode: str = "chatter_fusion") -> str:
     """
@@ -806,6 +820,9 @@ def diagnose_csv(csv_path: str, long_segment_size: int = SEGMENT_SIZE, mode: str
     result = read_and_validate_csv(csv_path)
     if 'error' in result:
         return f"⚠️ {result['error']}"
+
+    # 【v3.1】读入即绘制 4×1 原始信号图（不依赖模型，先于诊断报告生成）
+    fig_path = _plot_signal_for(csv_path, result)
 
     mode_name_map = {
         "chatter_amplitude": "幅值阈值诊断",

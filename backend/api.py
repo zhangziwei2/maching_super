@@ -131,7 +131,11 @@ async def _save_upload_stream(file: UploadFile, dest_dir: Path, filename: str) -
     :return: 实际落盘路径
     """
     dest_dir.mkdir(parents=True, exist_ok=True)
-    file_path = dest_dir / f"{uuid.uuid4().hex[:8]}_{_safe_filename(filename)}"
+    # 注意：调用方传入的 filename 已包含 uuid 前缀（见 upload_document_async 的 disk_name），
+    # 此处【不可】再叠加 uuid，否则落盘文件名会比实际传给任务的 file_path 多一个前缀，
+    # 导致后台解析时 os.path 找不到文件（"No such file or directory"）。
+    # 直接用调用方指定的 dest_dir/filename 落盘，保证落盘路径 == 任务队列里的 file_path。
+    file_path = dest_dir / _safe_filename(filename)
     written = 0
     try:
         with open(file_path, "wb") as f:

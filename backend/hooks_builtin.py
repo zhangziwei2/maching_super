@@ -10,7 +10,7 @@
 """
 import logging
 
-from .answerability import build_rejection_message
+from .answerability import build_rejection_message, hard_reject_message
 from .context_compact import compact_context
 from .hooks import register_hook
 from .tools import emit_rag_step
@@ -29,17 +29,42 @@ _GATE_STATUS_LABEL = {
 
 def answerability_gate(user_text: str, kg_result: str, rag_result: str, rag_gate: dict):
     """
-    可回答性门控：KG 无结果时按门控判定直接拒答，不走 LLM。
+    可回答性门控：依据不足时直接拒答，不走 LLM（零额外调用）。
 
-    与收编前主流程中的逻辑完全一致：
-        rejection = build_rejection_message(user_text, rag_gate) if not kg_result else None
+    ────────────────────────────────────────────────────────────────
+    判定逻辑（全量双路召回版本）
+    ────────────────────────────────────────────────────────────────
+    旧逻辑只有一行：
+        rejection = build_rejection_message(...) if not kg_result else None
+    含义是「图谱有结果就放行」。在单通道时代这没问题——图谱有结果说明确实
+    查到了相关实体。但改为全量双路召回后，两路恒定都查，而图谱中「主轴」
+    这类核心实体**几乎恒有结果**，该判断会导致门控永不生效。
+
+    更本质的缺陷：图谱返回三元组 ≠ 与问题相关。问「安全注意事项」时图谱会
+    返回「主轴 -[故障]-> 异响」，看似有依据，实则答非所问。
+
+    因此按「合计依据」而非「单源是否命中」判定：
+
+        两源皆空                    → 硬拒答（确实没有任何资料）
+        文档库有内容                → 按文档侧门控判定
+                                     （空检索/低分/冲突，规则完善且可解释）
+        仅图谱有内容                → 放行，但 _build_context 会标注依据来源，
+                                     提示模型"文档未覆盖时不要凭通用知识补条款"
 
     注册为 critical：门控失效会导致系统基于弱依据编造答案，
     必须以异常暴露，不能静默跳过。
     """
-    if kg_result:
-        return None
-    return build_rejection_message(user_text, rag_gate)
+    # 1) 两源皆空 —— 确实没有任何资料，硬拒答
+    if not kg_result and not rag_result:
+        return hard_reject_message(user_text)
+
+    # 2) 文档库有内容 —— 沿用其门控判定（answerability.evaluate 的规则已覆盖
+    #    hard_reject / soft_reject / conflict 三种状态，status=pass 时返回 None 放行）
+    if rag_result:
+        return build_rejection_message(user_text, rag_gate)
+
+    # 3) 仅图谱有内容 —— 放行，依据完整性交由上下文标注提示模型
+    return None
 
 
 def retrieval_progress(user_text: str, kg_result: str, rag_result: str, rag_gate: dict):

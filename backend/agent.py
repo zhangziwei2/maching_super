@@ -39,7 +39,6 @@ _env_path = Path(__file__).resolve().parent.parent / '.env'
 load_dotenv(dotenv_path=_env_path)
 
 # ---------- LLM API 配置（支持 DeepSeek / DashScope / OpenAI 等任意 OpenAI 兼容 API）----------
-# 优先级: LLM_API_KEY > DASHSCOPE_API_KEY（兼容旧配置）
 LLM_API_KEY = os.getenv("LLM_API_KEY")
 LLM_BASE_URL =  os.getenv("LLM_BASE_URL")
 LLM_MODEL = os.getenv("LLM_MODEL")
@@ -378,12 +377,31 @@ def _search_rag(query: str):
 
 
 def _build_context(kg_result: str, rag_result: str) -> str:
-    """合并 KG 和 RAG 的结果为上下文"""
+    """
+    合并知识图谱与文档库的检索结果，并**标注依据来源**。
+
+    为什么要标注来源？
+    全量双路召回后两路结果会同时出现。若不标注，模型无法区分"这是厂商手册
+    原文"还是"这是图谱里的故障因果三元组"，容易把图谱三元组当作操作规程来用。
+
+    为什么「仅图谱命中」时要额外提示？
+    图谱命中实体 ≠ 与问题相关。问「安全注意事项」时图谱会返回「主轴 -[故障]->
+    异响」这类三元组——看似有依据，实则答非所问。若不显式告知"文档库没有相关
+    内容"，模型会误以为依据充分，进而用通用知识补全具体条款（这是最危险的，
+    因为安全规程的编造可能违反厂家明文禁止的操作）。
+    """
     parts = []
     if kg_result:
-        parts.append(f"【知识图谱检索结果】\n{kg_result}")
+        parts.append(f"【知识图谱检索结果】(实体-关系三元组，用于故障因果推理)\n{kg_result}")
     if rag_result:
-        parts.append(f"【文档知识库检索结果】\n{rag_result}")
+        parts.append(f"【文档知识库检索结果】(来自上传文档原文，优先采用)\n{rag_result}")
+
+    if kg_result and not rag_result:
+        parts.append(
+            "【依据提示】本次未从上传文档中检索到相关内容，可用依据仅来自知识图谱。\n"
+            "若用户询问的是具体操作规程、安全规范或手册章节内容，应说明文档未覆盖，"
+            "不要凭通用知识补充具体条款或操作步骤。"
+        )
     return "\n\n".join(parts)
 
 
@@ -416,28 +434,72 @@ def _memory_before_drop(user_id: str, old_messages: list) -> None:
     extract_from_messages(user_id, old_messages, trigger="compact")
 
 
-def _retrieve_by_route(user_text: str, route: str):
-    """
-    按意图路由检索，返回 (kg_result, rag_result, rag_gate, rag_trace)。
+# 单路超时（秒）：图谱查询通常更快，给较短超时；文档检索含向量检索+重排，给足时间。
+# 全量双路并发后总耗时 = max(两路)，而非串行时两路之和。
+_KG_TIMEOUT = int(os.getenv("KG_RETRIEVE_TIMEOUT", "20"))
+_RAG_TIMEOUT = int(os.getenv("RAG_RETRIEVE_TIMEOUT", "45"))
 
-    hybrid 时 KG + RAG 并发，单个 future 限时 45s，防止任一检索源挂死拖住整条链路；
-    并发子任务经 copy_context 携带当前 ContextVar 快照，保证请求间互不串号。
+
+def _retrieve_all(user_text: str):
     """
-    kg_result, rag_result, rag_gate, rag_trace = "", "", {}, None
-    if route == "kg":
-        emit_rag_step("🔍", "知识图谱检索")
-        kg_result = _search_kg(user_text)
-    elif route == "rag":
-        emit_rag_step("📄", "文档知识库检索")
-        rag_result, rag_gate, rag_trace = _search_rag(user_text)
-    else:
-        emit_rag_step("🔍", "知识图谱检索")
-        emit_rag_step("📄", "文档知识库检索")
-        ctx = contextvars.copy_context()
-        kg_future = _retrieval_executor.submit(ctx.run, _search_kg, user_text)
-        rag_future = _retrieval_executor.submit(ctx.run, _search_rag, user_text)
-        kg_result = kg_future.result(timeout=45)
-        rag_result, rag_gate, rag_trace = rag_future.result(timeout=45)
+    全量双路召回：知识图谱与文档库**都查**，返回 (kg_result, rag_result, rag_gate, rag_trace)。
+
+    ────────────────────────────────────────────────────────────────
+    为什么不再按路由跳过某一路？（本次改造的核心）
+    ────────────────────────────────────────────────────────────────
+    旧逻辑按 IntentRouter 的判定三选一：route=="kg" 只查图谱、=="rag" 只查文档、
+    =="hybrid" 才两路都查。问题在于路由是**关键词规则**，会误判：
+
+        提问「主轴安全说明 2.1 注意事项有哪些？」
+        → 命中 KG 关键词「主轴」→ 判定为纯 KG 问题 → 只查图谱
+        → 但「2.1 注意事项」是手册章节，只存在于上传的 PDF 中
+        → 文档库从未被访问，模型只能凭通用知识编造 8 条"安全规范"
+
+    漏召回的代价远高于多查一次：工业诊断场景下，答非所问可能误导操作。
+    因此取消单通道跳过，两路恒定都查。路由结果仍保留并写入 rag_trace，
+    仅用于可观测性与事后分析，不再决定"要不要查某一路"。
+
+    ────────────────────────────────────────────────────────────────
+    为什么用并发而不是串行？
+    ────────────────────────────────────────────────────────────────
+    两路无依赖，并发耗时 = max(T_kg, T_rag)，串行 = T_kg + T_rag。
+    图谱抖动时并发能省下整段等待，拿到的结果完全一致。
+
+    ────────────────────────────────────────────────────────────────
+    两个易踩的坑（都已在下方代码中规避）
+    ────────────────────────────────────────────────────────────────
+    1) Context 复用：每个 future 必须用**各自独立**的 Context 快照。
+       Context.run() 规定同一个 Context 对象不能被多个线程同时进入（也不能嵌套）。
+       若复用同一个 ctx，两路真正并行时会抛
+         RuntimeError: cannot enter context: <Context> is already entered
+       两次 copy_context() 各自复制当前上下文，携带的 ContextVar 值相同，
+       请求间仍互不串号，且可在线程内安全改写。
+
+    2) 单路故障：任一路抛异常/超时时，只降级该路，保留另一路已得的结果。
+       旧写法中 KG 的 result() 先抛异常的话，RAG 已查到的内容会一并丢失。
+    """
+    emit_rag_step("🔍", "知识图谱检索")
+    emit_rag_step("📄", "文档知识库检索")
+
+    kg_future = _retrieval_executor.submit(
+        contextvars.copy_context().run, _search_kg, user_text)
+    rag_future = _retrieval_executor.submit(
+        contextvars.copy_context().run, _search_rag, user_text)
+
+    # 单路降级：图谱故障不应导致整轮对话失败，文档结果仍可用于作答
+    try:
+        kg_result = kg_future.result(timeout=_KG_TIMEOUT) or ""
+    except Exception as e:
+        logger.warning(f"[_retrieve_all] 知识图谱检索失败，降级为空: {e}", exc_info=True)
+        kg_result = ""
+
+    try:
+        rag_result, rag_gate, rag_trace = rag_future.result(timeout=_RAG_TIMEOUT)
+        rag_result, rag_gate = rag_result or "", rag_gate or {}
+    except Exception as e:
+        logger.warning(f"[_retrieve_all] 文档检索失败，降级为空: {e}", exc_info=True)
+        rag_result, rag_gate, rag_trace = "", {}, None
+
     return kg_result, rag_result, rag_gate, rag_trace
 
 
@@ -461,13 +523,21 @@ def _prepare_answer(user_text: str, user_id: str, session_id: str):
     if shortcut is not None:
         return messages, "", shortcut, None
 
-    # Item 4: 意图路由（纯规则，零额外 LLM）——命中单通道仅启用该通道，未命中/双命中则并发
+    # 意图路由（纯规则，零额外 LLM）。
+    # ⚠️ 路由结果**不再用于跳过检索源**——旧逻辑按 route 只查一路，会造成漏召回
+    # （例：「主轴安全说明 2.1 注意事项」因命中「主轴」被判为纯图谱问题，
+    #   而该内容只在上传文档中，导致文档库从未被访问、模型凭通用知识编造）。
+    # 现改为全量双路召回（见 _retrieve_all），route 仅保留用于可观测性。
     route = IntentRouter().route(user_text)["route"]
 
     # --- Hook: PreRetrieve —— 返回 str 则替换检索 query
     query = trigger_hooks("PreRetrieve", user_text, route) or user_text
 
-    kg_result, rag_result, rag_gate, rag_trace = _retrieve_by_route(query, route)
+    kg_result, rag_result, rag_gate, rag_trace = _retrieve_all(query)
+    if rag_trace is None:
+        rag_trace = {}
+    # 路由判断入 trace：前端展示与事后分析误判时依赖此字段
+    rag_trace["route"] = route
 
     # --- Hook: PostRetrieve —— 可回答性门控挂此处，返回 str 则作为拒答文案短路
     rejection = trigger_hooks("PostRetrieve", user_text, kg_result, rag_result, rag_gate)

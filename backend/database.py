@@ -14,14 +14,17 @@ DATABASE_URL = os.getenv(
     "postgresql+psycopg2://postgres:postgres@localhost:5432/langchain_app",
 )
 
-# SQLite 在多线程（ThreadPoolExecutor 后台上传任务）下默认禁止跨线程复用连接，
-# 会导致 "SQLite objects created in a thread..." 错误，甚至进度回调死锁卡在 89%。
-# 通过 check_same_thread=False + StaticPool 让单一连接在线程间安全共享（已有 manager 锁保护并发）。
+# SQLite 在多线程（后台上传任务、进度回调等）下有两个坑：
+# 1) 默认 check_same_thread=True 禁止跨线程用连接 → 需设 False；
+# 2) 若用 StaticPool 强制"单连接在线程间共享"，并发 commit 会让 SQLite C 层
+#    崩溃并返回 "commit() returned NULL without setting an exception"（Python 层无异常信息）。
+# 因此改用默认连接池（每线程/每请求独立连接）+ check_same_thread=False + timeout，
+# 既允许多线程各自拿连接，又避免单连接被并发复用导致的 NULL commit 崩溃。
 _connect_args = {}
 _engine_kwargs = {"pool_pre_ping": True}
 if DATABASE_URL.startswith("sqlite"):
     _connect_args["check_same_thread"] = False
-    _engine_kwargs["poolclass"] = __import__("sqlalchemy.pool", fromlist=["StaticPool"]).StaticPool
+    _connect_args["timeout"] = 30
 
 engine = create_engine(
     DATABASE_URL,
